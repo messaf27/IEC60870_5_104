@@ -16,9 +16,6 @@ bool IEC104Client::connect(const char* ip, uint16_t port) {
     
     if (client.connect(ip, port)) {
         sendStartDT();
-        if (connectedCallback) {
-            connectedCallback();
-        }
         return true;
     }
     return false;
@@ -39,6 +36,10 @@ void IEC104Client::run() {
     if (client.connected()) {
         handleIncomingData();
         sendKeepAlive();
+    } else {
+        if (disconnectedCallback) {
+            disconnectedCallback();
+        }
     }
 }
 
@@ -56,23 +57,48 @@ void IEC104Client::sendKeepAlive() {
 }
 
 void IEC104Client::handleIncomingData() {
-    while (client.available() >= 2) {
-        if (client.peek() != 0x68) {
-            client.read();
+    static uint8_t buffer[256];
+    static int bufferPos = 0;
+    
+    // Читаем доступные данные в буфер
+    while (client.available() && bufferPos < sizeof(buffer)) {
+        buffer[bufferPos++] = client.read();
+    }
+    
+    // Обрабатываем данные в буфере
+    int processed = 0;
+    while (bufferPos - processed >= 2) {
+        if (buffer[processed] != 0x68) {
+            processed++;
             continue;
         }
         
-        if (client.available() >= 6) {
-            uint8_t length = client.peek(1);
+        if (bufferPos - processed >= 6) {
+            uint8_t length = buffer[processed + 1];
             int totalLength = 2 + length;
             
-            if (client.available() >= totalLength) {
-                uint8_t* buffer = new uint8_t[totalLength];
-                client.read(buffer, totalLength);
-                processIECFrame(buffer, totalLength);
-                delete[] buffer;
+            if (bufferPos - processed >= totalLength) {
+                // У нас есть полный фрейм
+                uint8_t* frame = new uint8_t[totalLength];
+                memcpy(frame, buffer + processed, totalLength);
+                processIECFrame(frame, totalLength);
+                delete[] frame;
+                
+                processed += totalLength;
+            } else {
+                break; // Неполный фрейм, ждем больше данных
             }
+        } else {
+            break; // Недостаточно данных для заголовка
         }
+    }
+    
+    // Сдвигаем необработанные данные в начало буфера
+    if (processed > 0 && processed < bufferPos) {
+        memmove(buffer, buffer + processed, bufferPos - processed);
+        bufferPos -= processed;
+    } else {
+        bufferPos = 0;
     }
 }
 
@@ -130,6 +156,7 @@ void IEC104Client::processUFormat(uint8_t* frame, int length) {
             if (connectedCallback) {
                 connectedCallback();
             }
+            sendInterrogationCommand();
             break;
         case 0x43: // TESTFR_CON
             break;
@@ -235,7 +262,7 @@ bool IEC104Client::sendClockSyncCommand(uint16_t commonAddress) {
     data[len++] = 0x00;
     data[len++] = 0x00;
     
-    // CP56Time2a (8 байт)
+    // CP56Time2a (7 байт)
     uint8_t timeBuffer[7];
     getCP56Time(timeBuffer);
     memcpy(data + len, timeBuffer, 7);
