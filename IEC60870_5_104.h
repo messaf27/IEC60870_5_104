@@ -4,6 +4,10 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <functional>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 // Типы ASDU
 enum ASDUType {
@@ -86,6 +90,21 @@ struct ASDUInfo {
     uint16_t dataLength;
 };
 
+// Структура для команд
+struct IECCommand {
+    uint8_t type;
+    uint8_t* data;
+    uint16_t length;
+};
+
+// Типы команд
+#define CMD_CONNECT 1
+#define CMD_DISCONNECT 2
+#define CMD_INTERROGATION 3
+#define CMD_CLOCK_SYNC 4
+#define CMD_SINGLE_CMD 5
+#define CMD_DOUBLE_CMD 6
+
 // Callback типы
 typedef std::function<void()> OnConnectedCallback;
 typedef std::function<void()> OnDisconnectedCallback;
@@ -95,12 +114,14 @@ typedef std::function<void(uint16_t sendSeq, uint16_t recvSeq)> OnIFormatReceive
 class IEC104Client {
 public:
     IEC104Client();
+    ~IEC104Client();
     
     // Основные методы
     bool connect(const char* serverIP, uint16_t port = 2404);
     void disconnect();
     bool isConnected();
-    void run(); // Основной цикл обработки
+    void start(); // Запуск задач FreeRTOS
+    void stop();  // Остановка задач FreeRTOS
     
     // Команды
     bool sendInterrogationCommand(uint16_t commonAddress = 1, uint8_t qualifier = 20);
@@ -117,6 +138,8 @@ public:
     // Управление параметрами
     void setKeepAliveInterval(unsigned long interval) { keepAliveInterval = interval; }
     void setCommonAddress(uint16_t address) { localCommonAddress = address; }
+    void setTaskPriority(UBaseType_t priority) { taskPriority = priority; }
+    void setTaskStackSize(uint32_t stackSize) { taskStackSize = stackSize; }
     
 private:
     WiFiClient client;
@@ -127,6 +150,14 @@ private:
     uint16_t sendSequence;
     uint16_t receiveSequence;
     uint16_t localCommonAddress;
+    
+    // FreeRTOS элементы
+    TaskHandle_t communicationTaskHandle;
+    QueueHandle_t commandQueue;
+    SemaphoreHandle_t connectionMutex;
+    bool taskRunning;
+    UBaseType_t taskPriority;
+    uint32_t taskStackSize;
     
     // Таймеры
     unsigned long lastKeepAlive;
@@ -139,6 +170,9 @@ private:
     OnIFormatReceivedCallback iFormatReceivedCallback;
     
     // Внутренние методы
+    static void communicationTask(void* pvParameters);
+    void communicationTaskImpl();
+    void processCommands();
     void sendStartDT();
     void sendKeepAlive();
     void handleIncomingData();
@@ -147,13 +181,16 @@ private:
     void processSFormat(uint8_t* frame, int length);
     void processUFormat(uint8_t* frame, int length);
     void sendSFormat(uint16_t sequenceNumber);
-    void sendUFormat(uint8_t control);
     bool sendIFormat(uint8_t* data, uint16_t dataLength);
     void processASDU(uint8_t* asdu, uint16_t length);
+    void cleanupConnection();
     
     // Вспомогательные методы
     uint16_t getTimestamp();
     void getCP56Time(uint8_t* timeBuffer);
+    
+    // Методы для работы с очередью команд
+    bool queueCommand(uint8_t type, uint8_t* data = nullptr, uint16_t length = 0);
 };
 
 #endif

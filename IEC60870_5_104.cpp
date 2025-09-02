@@ -8,50 +8,276 @@ IEC104Client::IEC104Client() {
     localCommonAddress = 1;
     lastKeepAlive = 0;
     keepAliveInterval = 30000; // 30 секунд
+    taskRunning = false;
+    taskPriority = 1;
+    taskStackSize = 4096;
+    communicationTaskHandle = nullptr;
+    commandQueue = xQueueCreate(10, sizeof(IECCommand));
+    connectionMutex = xSemaphoreCreateMutex();
+    
+    // Инициализация Wi-Fi
+    WiFi.mode(WIFI_STA);
+}
+
+IEC104Client::~IEC104Client() {
+    stop();
+    if (commandQueue) {
+        vQueueDelete(commandQueue);
+    }
+    if (connectionMutex) {
+        vSemaphoreDelete(connectionMutex);
+    }
 }
 
 bool IEC104Client::connect(const char* ip, uint16_t port) {
     serverIP = String(ip);
     serverPort = port;
-    
-    if (client.connect(ip, port)) {
-        sendStartDT();
-        return true;
+    return queueCommand(CMD_CONNECT);
+}
+
+void IEC104Client::disconnect() {
+    queueCommand(CMD_DISCONNECT);
+}
+
+bool IEC104Client::isConnected() {
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        bool connected = client.connected();
+        xSemaphoreGive(connectionMutex);
+        return connected;
     }
     return false;
 }
 
-void IEC104Client::disconnect() {
-    client.stop();
-    if (disconnectedCallback) {
-        disconnectedCallback();
+void IEC104Client::start() {
+    if (!taskRunning) {
+        taskRunning = true;
+        xTaskCreate(
+            communicationTask,
+            "IEC104_Task",
+            taskStackSize,
+            this,
+            taskPriority,
+            &communicationTaskHandle
+        );
     }
 }
 
-bool IEC104Client::isConnected() {
-    return client.connected();
+void IEC104Client::stop() {
+    if (taskRunning) {
+        taskRunning = false;
+        if (communicationTaskHandle) {
+            vTaskDelete(communicationTaskHandle);
+            communicationTaskHandle = nullptr;
+        }
+    }
+    cleanupConnection();
 }
 
-void IEC104Client::run() {
-    if (client.connected()) {
-        handleIncomingData();
-        sendKeepAlive();
-    } else {
-        if (disconnectedCallback) {
-            disconnectedCallback();
+void IEC104Client::communicationTask(void* pvParameters) {
+    IEC104Client* client = static_cast<IEC104Client*>(pvParameters);
+    client->communicationTaskImpl();
+    vTaskDelete(nullptr);
+}
+
+void IEC104Client::communicationTaskImpl() {
+    while (taskRunning) {
+        // Обработка команд из очереди
+        processCommands();
+        
+        // Обработка сетевых данных
+        if (isConnected()) {
+            handleIncomingData();
+            sendKeepAlive();
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void IEC104Client::processCommands() {
+    IECCommand cmd;
+    while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+        switch (cmd.type) {
+            case CMD_CONNECT: {
+                if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                    if (!client.connected()) {
+                        if (client.connect(serverIP.c_str(), serverPort)) {
+                            sendStartDT();
+                        }
+                    }
+                    xSemaphoreGive(connectionMutex);
+                }
+                break;
+            }
+            
+            case CMD_DISCONNECT: {
+                if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                    if (client.connected()) {
+                        client.stop();
+                        if (disconnectedCallback) {
+                            disconnectedCallback();
+                        }
+                    }
+                    xSemaphoreGive(connectionMutex);
+                }
+                break;
+            }
+            
+            case CMD_INTERROGATION: {
+                if (cmd.data && cmd.length >= 3) {
+                    uint16_t addr = cmd.data[0] | (cmd.data[1] << 8);
+                    uint8_t qualifier = cmd.data[2];
+                    sendInterrogationCommand(addr, qualifier);
+                }
+                break;
+            }
+            
+            case CMD_CLOCK_SYNC: {
+                if (cmd.data && cmd.length >= 2) {
+                    uint16_t addr = cmd.data[0] | (cmd.data[1] << 8);
+                    sendClockSyncCommand(addr);
+                }
+                break;
+            }
+            
+            case CMD_SINGLE_CMD: {
+                if (cmd.data && cmd.length >= 6) {
+                    uint16_t addr = cmd.data[0] | (cmd.data[1] << 8);
+                    uint32_t ioa = cmd.data[2] | (cmd.data[3] << 8) | (cmd.data[4] << 16);
+                    bool state = cmd.data[5];
+                    sendSingleCommand(addr, ioa, state);
+                }
+                break;
+            }
+            
+            case CMD_DOUBLE_CMD: {
+                if (cmd.data && cmd.length >= 6) {
+                    uint16_t addr = cmd.data[0] | (cmd.data[1] << 8);
+                    uint32_t ioa = cmd.data[2] | (cmd.data[3] << 8) | (cmd.data[4] << 16);
+                    uint8_t state = cmd.data[5];
+                    sendDoubleCommand(addr, ioa, state);
+                }
+                break;
+            }
+        }
+        
+        // Освобождаем память команды
+        if (cmd.data) {
+            delete[] cmd.data;
         }
     }
 }
 
+bool IEC104Client::queueCommand(uint8_t type, uint8_t* data, uint16_t length) {
+    IECCommand cmd;
+    cmd.type = type;
+    cmd.data = data;
+    cmd.length = length;
+    
+    BaseType_t result = xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    return result == pdTRUE;
+}
+
+bool IEC104Client::sendInterrogationCommand(uint16_t commonAddress, uint8_t qualifier) {
+    uint8_t* data = new uint8_t[3];
+    data[0] = commonAddress & 0xFF;
+    data[1] = (commonAddress >> 8) & 0xFF;
+    data[2] = qualifier;
+    
+    IECCommand cmd;
+    cmd.type = CMD_INTERROGATION;
+    cmd.data = data;
+    cmd.length = 3;
+    
+    BaseType_t result = xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    if (result != pdTRUE) {
+        delete[] data;
+        return false;
+    }
+    return true;
+}
+
+bool IEC104Client::sendClockSyncCommand(uint16_t commonAddress) {
+    uint8_t* data = new uint8_t[2];
+    data[0] = commonAddress & 0xFF;
+    data[1] = (commonAddress >> 8) & 0xFF;
+    
+    IECCommand cmd;
+    cmd.type = CMD_CLOCK_SYNC;
+    cmd.data = data;
+    cmd.length = 2;
+    
+    BaseType_t result = xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    if (result != pdTRUE) {
+        delete[] data;
+        return false;
+    }
+    return true;
+}
+
+bool IEC104Client::sendSingleCommand(uint16_t commonAddress, uint32_t ioa, bool state) {
+    uint8_t* data = new uint8_t[6];
+    data[0] = commonAddress & 0xFF;
+    data[1] = (commonAddress >> 8) & 0xFF;
+    data[2] = ioa & 0xFF;
+    data[3] = (ioa >> 8) & 0xFF;
+    data[4] = (ioa >> 16) & 0xFF;
+    data[5] = state ? 1 : 0;
+    
+    IECCommand cmd;
+    cmd.type = CMD_SINGLE_CMD;
+    cmd.data = data;
+    cmd.length = 6;
+    
+    BaseType_t result = xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    if (result != pdTRUE) {
+        delete[] data;
+        return false;
+    }
+    return true;
+}
+
+bool IEC104Client::sendDoubleCommand(uint16_t commonAddress, uint32_t ioa, uint8_t state) {
+    uint8_t* data = new uint8_t[6];
+    data[0] = commonAddress & 0xFF;
+    data[1] = (commonAddress >> 8) & 0xFF;
+    data[2] = ioa & 0xFF;
+    data[3] = (ioa >> 8) & 0xFF;
+    data[4] = (ioa >> 16) & 0xFF;
+    data[5] = state & 0x03;
+    
+    IECCommand cmd;
+    cmd.type = CMD_DOUBLE_CMD;
+    cmd.data = data;
+    cmd.length = 6;
+    
+    BaseType_t result = xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    if (result != pdTRUE) {
+        delete[] data;
+        return false;
+    }
+    return true;
+}
+
 void IEC104Client::sendStartDT() {
     uint8_t startDT[] = {0x68, 0x04, 0x07, 0x00, 0x00, 0x00};
-    client.write(startDT, sizeof(startDT));
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (client.connected()) {
+            client.write(startDT, sizeof(startDT));
+        }
+        xSemaphoreGive(connectionMutex);
+    }
 }
 
 void IEC104Client::sendKeepAlive() {
     if (millis() - lastKeepAlive > keepAliveInterval) {
         uint8_t testfr[] = {0x68, 0x04, 0x43, 0x00, 0x00, 0x00};
-        client.write(testfr, sizeof(testfr));
+        if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (client.connected()) {
+                client.write(testfr, sizeof(testfr));
+            }
+            xSemaphoreGive(connectionMutex);
+        }
         lastKeepAlive = millis();
     }
 }
@@ -59,6 +285,18 @@ void IEC104Client::sendKeepAlive() {
 void IEC104Client::handleIncomingData() {
     static uint8_t buffer[256];
     static int bufferPos = 0;
+    
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return;
+    }
+    
+    if (!client.connected()) {
+        xSemaphoreGive(connectionMutex);
+        if (disconnectedCallback) {
+            disconnectedCallback();
+        }
+        return;
+    }
     
     // Читаем доступные данные в буфер
     while (client.available() && bufferPos < sizeof(buffer)) {
@@ -100,6 +338,8 @@ void IEC104Client::handleIncomingData() {
     } else {
         bufferPos = 0;
     }
+    
+    xSemaphoreGive(connectionMutex);
 }
 
 void IEC104Client::processIECFrame(uint8_t* frame, int length) {
@@ -172,29 +412,23 @@ void IEC104Client::sendSFormat(uint16_t sequenceNumber) {
     sFrame[4] = 0x01;
     sFrame[5] = 0x00;
     
-    client.write(sFrame, sizeof(sFrame));
-}
-
-bool IEC104Client::sendInterrogationCommand(uint16_t commonAddress, uint8_t qualifier) {
-    uint8_t data[10];
-    int len = 0;
-    
-    data[len++] = C_IC_NA_1;        // Type ID
-    data[len++] = 0x01;             // Number of objects
-    data[len++] = ACTIVATION;       // Cause of transmission
-    data[len++] = 0x00;             // Originator address
-    data[len++] = commonAddress & 0xFF;
-    data[len++] = (commonAddress >> 8) & 0xFF;
-    data[len++] = 0x00;             // IOA
-    data[len++] = 0x00;
-    data[len++] = 0x00;
-    data[len++] = qualifier;        // QOI
-    
-    return sendIFormat(data, len);
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (client.connected()) {
+            client.write(sFrame, sizeof(sFrame));
+        }
+        xSemaphoreGive(connectionMutex);
+    }
 }
 
 bool IEC104Client::sendIFormat(uint8_t* data, uint16_t dataLength) {
-    if (!client.connected()) return false;
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    
+    if (!client.connected()) {
+        xSemaphoreGive(connectionMutex);
+        return false;
+    }
     
     uint16_t frameLength = 4 + dataLength;
     uint8_t* frame = new uint8_t[frameLength + 2];
@@ -211,6 +445,7 @@ bool IEC104Client::sendIFormat(uint8_t* data, uint16_t dataLength) {
     client.write(frame, frameLength + 2);
     sendSequence++;
     
+    xSemaphoreGive(connectionMutex);
     delete[] frame;
     return true;
 }
@@ -248,63 +483,13 @@ void IEC104Client::onIFormatReceived(OnIFormatReceivedCallback callback) {
     iFormatReceivedCallback = callback;
 }
 
-bool IEC104Client::sendClockSyncCommand(uint16_t commonAddress) {
-    uint8_t data[13];
-    int len = 0;
-    
-    data[len++] = C_CS_NA_1;        // Type ID
-    data[len++] = 0x01;             // Number of objects
-    data[len++] = ACTIVATION;       // Cause of transmission
-    data[len++] = 0x00;             // Originator address
-    data[len++] = commonAddress & 0xFF;
-    data[len++] = (commonAddress >> 8) & 0xFF;
-    data[len++] = 0x00;             // IOA
-    data[len++] = 0x00;
-    data[len++] = 0x00;
-    
-    // CP56Time2a (7 байт)
-    uint8_t timeBuffer[7];
-    getCP56Time(timeBuffer);
-    memcpy(data + len, timeBuffer, 7);
-    len += 7;
-    
-    return sendIFormat(data, len);
-}
-
-bool IEC104Client::sendSingleCommand(uint16_t commonAddress, uint32_t ioa, bool state) {
-    uint8_t data[10];
-    int len = 0;
-    
-    data[len++] = C_SC_NA_1;        // Type ID
-    data[len++] = 0x01;             // Number of objects
-    data[len++] = ACTIVATION;       // Cause of transmission
-    data[len++] = 0x00;             // Originator address
-    data[len++] = commonAddress & 0xFF;
-    data[len++] = (commonAddress >> 8) & 0xFF;
-    data[len++] = ioa & 0xFF;
-    data[len++] = (ioa >> 8) & 0xFF;
-    data[len++] = (ioa >> 16) & 0xFF;
-    data[len++] = state ? 0x81 : 0x80; // SCS + QU=0 + SE=1
-    
-    return sendIFormat(data, len);
-}
-
-bool IEC104Client::sendDoubleCommand(uint16_t commonAddress, uint32_t ioa, uint8_t state) {
-    uint8_t data[10];
-    int len = 0;
-    
-    data[len++] = C_DC_NA_1;        // Type ID
-    data[len++] = 0x01;             // Number of objects
-    data[len++] = ACTIVATION;       // Cause of transmission
-    data[len++] = 0x00;             // Originator address
-    data[len++] = commonAddress & 0xFF;
-    data[len++] = (commonAddress >> 8) & 0xFF;
-    data[len++] = ioa & 0xFF;
-    data[len++] = (ioa >> 8) & 0xFF;
-    data[len++] = (ioa >> 16) & 0xFF;
-    data[len++] = (state & 0x03) | 0x80; // DCS + QU=0 + SE=1
-    
-    return sendIFormat(data, len);
+void IEC104Client::cleanupConnection() {
+    if (xSemaphoreTake(connectionMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (client.connected()) {
+            client.stop();
+        }
+        xSemaphoreGive(connectionMutex);
+    }
 }
 
 uint16_t IEC104Client::getTimestamp() {
