@@ -8,14 +8,26 @@ IEC104Client iec104;
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("Starting IEC 60870-5-104 Client with FreeRTOS...");
   
   // Подключение к Wi-Fi
   WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
   Serial.println("\nWiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());  // Вывод IP адреса
+  
+  // Настройка параметров ДО запуска задачи
+  iec104.setTaskStackSize(8192);
+  iec104.setTaskPriority(2);
+  iec104.setKeepAliveInterval(15000);
+  iec104.setCommonAddress(1);
   
   // Настройка callback'ов
   iec104.onConnected([]() {
@@ -27,8 +39,8 @@ void setup() {
   });
   
   iec104.onASDUReceived([](ASDUInfo& info) {
-    Serial.printf("ASDU Received - Type: %d, Objects: %d, COT: %d\n", 
-                  info.typeID, info.numberOfObjects, info.causeOfTransmission);
+    Serial.printf("ASDU: Type=%d, Objects=%d, COT=%d, CA=%d\n", 
+                  info.typeID, info.numberOfObjects, info.causeOfTransmission, info.commonAddress);
   });
   
   // Запуск задачи FreeRTOS
@@ -36,21 +48,14 @@ void setup() {
   
   // Подключение к серверу
   if (iec104.connect("192.168.1.100", 2404)) {
-    Serial.println("Connecting to IEC 104 server...");
+    Serial.println("Connection command queued");
   } else {
     Serial.println("Failed to queue connection command");
   }
 }
 
 void loop() {
-  // Основной поток может выполнять другие задачи
-  // Все операции IEC 104 выполняются в отдельной задаче FreeRTOS
-  delay(1000);
-  
-  // Пример отправки команды раз в 10 секунд
-  static unsigned long lastCommand = 0;
-  if (millis() - lastCommand > 10000) {
-    iec104.sendInterrogationCommand();
-    lastCommand = millis();
-  }
+  // Основной поток свободен для других задач
+  delay(5000);
+  Serial.println("Main task running...");
 }
